@@ -247,8 +247,16 @@ class Stage3FSM:
                 )
             return
 
-        # Armed: apply climb throttle
-        thr = self._cfg.stage3.nav.takeoff_throttle_pwm
+        # Armed: apply full climb initially, then taper throttle as we approach target altitude.
+        nav_cfg = self._cfg.stage3.nav
+        taper_start_alt = target_alt * nav_cfg.takeoff_taper_start_fraction
+        if alt >= taper_start_alt:
+            thr = max(
+                nav_cfg.takeoff_taper_min_pwm,
+                self._alt_ctrl.compute(target_alt, alt, time.monotonic()),
+            )
+        else:
+            thr = nav_cfg.takeoff_throttle_pwm
         cmd = self._rc.apply(
             roll=neutral.roll,
             pitch=neutral.pitch,
@@ -265,7 +273,7 @@ class Stage3FSM:
             cmd.throttle,
         )
 
-        threshold = target_alt * self._cfg.stage3.nav.takeoff_complete_fraction
+        threshold = target_alt * nav_cfg.takeoff_complete_fraction
         if alt >= threshold:
             self._alt_ctrl.reset()
             self._transition(
@@ -289,7 +297,12 @@ class Stage3FSM:
         yaw_delta = int(max(-200, min(200, yaw_err * yaw_kp)))
         # Suppress forward pitch until heading is roughly aligned with bearing
         aligned = abs(yaw_err) <= self._cfg.stage3.nav.align_threshold_deg
-        pitch_delta = self._cfg.stage3.nav.pitch_delta_cruise if aligned else 0
+        if aligned:
+            ramp_s = max(0.5, self._cfg.stage3.nav.enroute_pitch_ramp_s)
+            ramp = min(1.0, elapsed_s / ramp_s)
+            pitch_delta = int(round(self._cfg.stage3.nav.pitch_delta_cruise * ramp))
+        else:
+            pitch_delta = 0
 
         cmd = self._rc.apply(
             roll=neutral.roll,
@@ -328,20 +341,18 @@ class Stage3FSM:
         yaw_delta = int(max(-150, min(150, yaw_err * yaw_kp)))
         aligned = abs(yaw_err) <= self._cfg.stage3.nav.align_threshold_deg
 
-        # In the final approach, reduce forward pitch as we get closer to B.
-        # This lowers residual horizontal speed and improves landing accuracy.
-        r_land = self._cfg.stage3.nav.r_land_trigger_m
-        max_fine = self._cfg.stage3.nav.pitch_delta_fine
+        # In the final approach, keep momentum until close to B, then slow down sharply.
+        nav_cfg = self._cfg.stage3.nav
+        r_land = nav_cfg.r_land_trigger_m
+        slowdown_start = nav_cfg.r_approach_slowdown_m
+        max_fine = nav_cfg.pitch_delta_fine
+        min_fine = nav_cfg.pitch_delta_fine_min
         if aligned and dist > r_land:
-            # Two-phase slowdown:
-            # 1. From 80m→30m: maintain full pitch (cruise speed)
-            # 2. From 30m→8m: linearly reduce pitch from max to minimum (gradual decel)
-            if dist > 30.0:
-                pitch_delta = max_fine  # Full forward authority to maintain speed cruising in
+            if dist > slowdown_start:
+                pitch_delta = max_fine
             else:
-                # Linear ramp: 30m → 8m corresponds to max_fine → 20 PWM
-                ratio = (dist - r_land) / (30.0 - r_land)  # 0.0 to 1.0
-                pitch_delta = int(20.0 + ratio * (max_fine - 20.0))
+                ratio = max(0.0, min(1.0, (dist - r_land) / (slowdown_start - r_land)))
+                pitch_delta = int(round(min_fine + ratio * (max_fine - min_fine)))
         else:
             pitch_delta = 0
 
@@ -361,15 +372,14 @@ class Stage3FSM:
             cmd.roll, cmd.pitch, cmd.throttle, cmd.yaw,
         )
 
-        r_land = self._cfg.stage3.nav.r_land_trigger_m
-        h_thresh = self._cfg.stage3.nav.land_h_speed_threshold_ms
+        h_thresh = nav_cfg.land_h_speed_threshold_ms
 
         if dist <= r_land and h_speed < h_thresh:
             self._transition(
                 Stage3State.LANDING,
                 f"landing: dist={dist:.1f}m h_speed={h_speed:.2f}m/s",
             )
-        elif dist <= self._cfg.stage3.nav.r_arrival_m:
+        elif dist <= nav_cfg.r_arrival_m:
             self._transition(
                 Stage3State.LANDING,
                 f"arrival radius: dist={dist:.1f}m forcing landing",
@@ -385,13 +395,11 @@ class Stage3FSM:
         hover = self._cfg.stage3.alt_ctrl.hover_pwm
         min_pwm = self._cfg.rc_override.bounds.min_pwm
 
-        # Two-phase descent
+        # Assertive descent to avoid ballooning after switching from approach to landing.
         if alt > 5.0:
-            # Ramp below hover; floor at hover-150 so it doesn't free-fall
-            desc_thr = max(hover - 150, hover - int(elapsed_s * 2))
+            desc_thr = max(hover - 180, hover - 40 - int(elapsed_s * 4))
         elif alt > self._cfg.stage3.nav.land_complete_alt_m:
-            # Flare: gentle, slightly below hover
-            desc_thr = hover - 80
+            desc_thr = hover - 90
         else:
             desc_thr = max(min_pwm, hover - 200)
 

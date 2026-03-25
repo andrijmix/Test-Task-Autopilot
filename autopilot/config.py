@@ -80,8 +80,8 @@ class MissionRuntimeConfig:
 class AltControllerConfig:
     """Tuning for PI altitude controller (throttle channel)."""
 
-    kp: float = 5.0           # P gain: 1 m error → 5 PWM
-    ki: float = 0.05          # I gain: mild integral correction
+    kp: float = 6.5           # Slightly stronger altitude hold under aggressive pitch
+    ki: float = 0.08          # Faster steady-state correction during cruise
     hover_pwm: int = 1500     # PWM for level hover in Stabilize
     max_delta_pwm: int = 200  # Max throttle deviation from hover
 
@@ -104,7 +104,9 @@ class Stage3NavConfig:
 
     # Takeoff
     takeoff_throttle_pwm: int = 1680          # RC throttle for initial climb
-    takeoff_complete_fraction: float = 0.90   # Transition to ENROUTE at 90% target alt
+    takeoff_taper_start_fraction: float = 0.55  # Start reducing climb authority earlier to limit overshoot
+    takeoff_taper_min_pwm: int = 1510         # Near-hover throttle before handoff to ENROUTE
+    takeoff_complete_fraction: float = 0.97   # Hand off close to target altitude, not at 90 m
 
     # Yaw controller (P gain, deg error → PWM delta)
     yaw_kp: float = 2.5
@@ -112,17 +114,20 @@ class Stage3NavConfig:
     # Pitch forward force
     pitch_delta_cruise: int = 120             # PWM delta during ENROUTE_TO_B (higher speed on long route)
     pitch_delta_fine: int = 80                # Max PWM delta during APPROACH_FINE (maintain momentum, reduce near landing)
+    pitch_delta_fine_min: int = 20            # Keep enough forward authority to actually close the last metres
+    enroute_pitch_ramp_s: float = 8.0         # Smoothly ramp pitch after takeoff to protect altitude hold
 
     # Heading alignment guard
     align_threshold_deg: float = 20.0        # suppress forward pitch until within this many degrees of bearing
 
     # Phase transition radii [m]
     r_cruise_to_fine_m: float = 80.0          # Switch ENROUTE → APPROACH_FINE
-    r_land_trigger_m: float = 8.0             # Trigger LANDING from APPROACH_FINE
-    r_arrival_m: float = 6.0                  # Hard arrival radius
+    r_approach_slowdown_m: float = 18.0       # Stay assertive longer, then brake later
+    r_land_trigger_m: float = 4.8             # Trigger LANDING close enough to finish under 5 m
+    r_arrival_m: float = 3.0                  # Hard arrival radius
 
     # Landing conditions
-    land_h_speed_threshold_ms: float = 0.5    # Max horizontal speed to approve landing
+    land_h_speed_threshold_ms: float = 0.25   # Allow landing once essentially stopped near the target
     land_complete_alt_m: float = 2.0          # Consider landed below this altitude [m]
 
 
