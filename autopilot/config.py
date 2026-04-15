@@ -103,31 +103,41 @@ class Stage3NavConfig:
     """Navigation and control parameters for Stage 3."""
 
     # Takeoff
-    takeoff_throttle_pwm: int = 1680          # RC throttle for initial climb
+    takeoff_throttle_pwm: int = 1580          # RC throttle for initial climb
     takeoff_taper_start_fraction: float = 0.55  # Start reducing climb authority earlier to limit overshoot
     takeoff_taper_min_pwm: int = 1510         # Near-hover throttle before handoff to ENROUTE
     takeoff_complete_fraction: float = 0.97   # Hand off close to target altitude, not at 90 m
+    takeoff_pitch_kp: float = 200.0           # P gain: horizontal drift → corrective pitch (PWM per m/s)
+    takeoff_pitch_ki: float = 40.0            # I gain: eliminates steady-state wind offset (PWM per m)
+    takeoff_pitch_correction_max: int = 300   # Max corrective pitch PWM during takeoff
 
     # Yaw controller (P gain, deg error → PWM delta)
     yaw_kp: float = 2.5
 
     # Pitch forward force
-    pitch_delta_cruise: int = 120             # PWM delta during ENROUTE_TO_B (higher speed on long route)
-    pitch_delta_fine: int = 80                # Max PWM delta during APPROACH_FINE (maintain momentum, reduce near landing)
-    pitch_delta_fine_min: int = 20            # Keep enough forward authority to actually close the last metres
+    pitch_delta_cruise: int = 1200             # PWM delta during ENROUTE_TO_B (higher speed on long route)
+    enroute_unaligned_pitch_base: int = 120    # Keep some forward authority while yaw catches up so wind does not blow us off track
+    enroute_unaligned_target_speed_ms: float = 0.2  # When unaligned, bleed projected speed only down to near-zero, not below
+    enroute_unaligned_speed_kp: float = 60.0   # Speed-hold correction around the unaligned base pitch (PWM per m/s)
+    pitch_delta_fine: int = 80                # Base PWM delta during APPROACH_FINE before speed feedback is applied
+    pitch_delta_fine_min: int = 20            # Small base pitch that helps keep closing distance when the speed error is near zero
+    approach_target_speed_max_ms: float = 2.0  # Desired approach track speed near the slowdown boundary
+    approach_hover_target_speed_ms: float = 0.0  # Desired track speed over the landing radius: hover nearly in place
+    approach_pitch_speed_kp: float = 80.0     # Track-speed feedback during APPROACH_FINE (PWM per m/s)
+    approach_pitch_delta_max: int = 260       # Cap recovery pitch during APPROACH_FINE so it stays gentler than cruise
     enroute_pitch_ramp_s: float = 8.0         # Smoothly ramp pitch after takeoff to protect altitude hold
 
     # Heading alignment guard
     align_threshold_deg: float = 20.0        # suppress forward pitch until within this many degrees of bearing
 
     # Phase transition radii [m]
-    r_cruise_to_fine_m: float = 80.0          # Switch ENROUTE → APPROACH_FINE
+    r_cruise_to_fine_m: float = 18.0         # Switch ENROUTE → APPROACH_FINE before the slowdown zone, not on top of the point
     r_approach_slowdown_m: float = 18.0       # Stay assertive longer, then brake later
     r_land_trigger_m: float = 4.8             # Trigger LANDING close enough to finish under 5 m
     r_arrival_m: float = 3.0                  # Hard arrival radius
 
     # Landing conditions
-    land_h_speed_threshold_ms: float = 0.25   # Allow landing once essentially stopped near the target
+    land_h_speed_threshold_ms: float = 0.25   # Allow landing once total horizontal speed is essentially stopped near the target
     land_complete_alt_m: float = 2.0          # Consider landed below this altitude [m]
 
 
@@ -155,7 +165,7 @@ def build_default_config() -> AppConfig:
         mission=MissionConfig(
             point_a=GeoPoint(lat=50.450739, lon=30.461242),
             point_b=GeoPoint(lat=50.443326, lon=30.448078),
-            target_altitude_m=100.0,
+            target_altitude_m=300.0,
         ),
         preflight=PreflightConfig(),
         telemetry=TelemetryConfig(),

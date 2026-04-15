@@ -14,9 +14,10 @@ Control overview
   Heading: P controller on yaw channel (CH4).
       yaw_pwm = neutral_yaw + Kp_yaw * normalize(bearing_to_B - heading)
 
-  Forward motion: constant positive pitch delta on pitch channel (CH2).
-      ENROUTE:  neutral_pitch + pitch_delta_cruise   (aggressive)
-      APPROACH: neutral_pitch + pitch_delta_fine     (gentle)
+        Forward motion: positive pitch delta on pitch channel (CH2).
+            ENROUTE:  neutral_pitch + pitch_delta_cruise   (aggressive when aligned)
+                    reduced adaptively during yaw correction to keep target-track speed near zero
+          APPROACH: speed-targeted pitch that tapers the desired track speed to near-zero over B
 
   Landing: two-phase throttle reduction.
       alt > 5 m  → ramp below hover at 2 PWM/s, floor = hover-150
@@ -116,6 +117,9 @@ class Stage3FSM:
             max_pwm=cfg.rc_override.bounds.max_pwm,
             max_delta_pwm=s3.alt_ctrl.max_delta_pwm,
         )
+        self._takeoff_pitch_integral = 0.0
+        self._takeoff_roll_integral = 0.0
+        self._takeoff_pitch_last_t = time.monotonic()
 
     # ------------------------------------------------------------------
     # Public API
@@ -301,23 +305,22 @@ class Stage3FSM:
         if nav is None:
             return
 
-        lat, lon, alt, dist, brng, yaw_err, heading = nav
+        _, _, alt, dist, brng, yaw_err, heading = nav
         target_alt = self._cfg.mission.target_altitude_m
         alt_err = target_alt - alt
 
         throttle = self._alt_ctrl.compute(target_alt, alt, time.monotonic())
         neutral = self._rc.neutral_command()
+        h_speed = self._horizontal_speed(brng)
 
         yaw_kp = self._cfg.stage3.nav.yaw_kp
         yaw_delta = int(max(-200, min(200, yaw_err * yaw_kp)))
-        # Suppress forward pitch until heading is roughly aligned with bearing
         aligned = abs(yaw_err) <= self._cfg.stage3.nav.align_threshold_deg
-        if aligned:
-            ramp_s = max(0.5, self._cfg.stage3.nav.enroute_pitch_ramp_s)
-            ramp = min(1.0, elapsed_s / ramp_s)
-            pitch_delta = int(round(self._cfg.stage3.nav.pitch_delta_cruise * ramp))
-        else:
-            pitch_delta = 0
+        pitch_delta = self._enroute_pitch_delta(
+            elapsed_s=elapsed_s,
+            yaw_err=yaw_err,
+            h_speed=h_speed,
+        )
 
         cmd = self._rc.apply(
             roll=neutral.roll,
@@ -326,7 +329,6 @@ class Stage3FSM:
             yaw=neutral.yaw + yaw_delta,
         )
 
-        h_speed = self._horizontal_speed(brng)
         self._logger.info(
             "state=ENROUTE_TO_B  dist=%.1fm  brng=%.1f  hdg=%.1f  "
             "alt=%.1fm  alt_err=%.1f  h_speed=%.2fm/s  aligned=%s  rc(roll=%d pitch=%d thr=%d yaw=%d)",
@@ -334,43 +336,35 @@ class Stage3FSM:
             cmd.roll, cmd.pitch, cmd.throttle, cmd.yaw,
         )
 
-        r_fine = self._cfg.stage3.nav.r_cruise_to_fine_m
+        r_fine = self._fine_approach_entry_radius()
         if dist <= r_fine:
             self._transition(
                 Stage3State.APPROACH_FINE,
                 f"fine approach: dist={dist:.1f}m <= r_fine={r_fine:.1f}m",
             )
 
-    def _tick_approach(self, elapsed_s: float) -> None:
+    def _tick_approach(self, _elapsed_s: float) -> None:
         nav = self._nav_snapshot()
         if nav is None:
             return
 
-        lat, lon, alt, dist, brng, yaw_err, heading = nav
+        _, _, alt, dist, brng, yaw_err, _ = nav
         target_alt = self._cfg.mission.target_altitude_m
         alt_err = target_alt - alt
 
         throttle = self._alt_ctrl.compute(target_alt, alt, time.monotonic())
         neutral = self._rc.neutral_command()
+        track_h_speed = self._horizontal_speed(brng)
+        total_h_speed = self._horizontal_speed()
 
         yaw_kp = self._cfg.stage3.nav.yaw_kp
         yaw_delta = int(max(-150, min(150, yaw_err * yaw_kp)))
         aligned = abs(yaw_err) <= self._cfg.stage3.nav.align_threshold_deg
 
-        # In the final approach, keep momentum until close to B, then slow down sharply.
         nav_cfg = self._cfg.stage3.nav
         r_land = nav_cfg.r_land_trigger_m
-        slowdown_start = nav_cfg.r_approach_slowdown_m
-        max_fine = nav_cfg.pitch_delta_fine
-        min_fine = nav_cfg.pitch_delta_fine_min
-        if aligned and dist > r_land:
-            if dist > slowdown_start:
-                pitch_delta = max_fine
-            else:
-                ratio = max(0.0, min(1.0, (dist - r_land) / (slowdown_start - r_land)))
-                pitch_delta = int(round(min_fine + ratio * (max_fine - min_fine)))
-        else:
-            pitch_delta = 0
+        target_track_speed = self._approach_target_track_speed(dist)
+        pitch_delta = self._approach_pitch_delta(dist=dist, yaw_err=yaw_err, track_h_speed=track_h_speed)
 
         cmd = self._rc.apply(
             roll=neutral.roll,
@@ -379,40 +373,42 @@ class Stage3FSM:
             yaw=neutral.yaw + yaw_delta,
         )
 
-        h_speed = self._horizontal_speed(brng)
-
         self._logger.info(
             "state=APPROACH_FINE  dist=%.1fm  alt=%.1fm  alt_err=%.1f  "
-            "h_speed=%.2fm/s  aligned=%s  rc(roll=%d pitch=%d thr=%d yaw=%d)",
-            dist, alt, alt_err, h_speed, aligned,
+            "track_h_speed=%.2fm/s  target_track_speed=%.2fm/s  h_speed=%.2fm/s  aligned=%s  rc(roll=%d pitch=%d thr=%d yaw=%d)",
+            dist, alt, alt_err, track_h_speed, target_track_speed, total_h_speed, aligned,
             cmd.roll, cmd.pitch, cmd.throttle, cmd.yaw,
         )
 
-        h_thresh = nav_cfg.land_h_speed_threshold_ms
-
-        if dist <= r_land and h_speed < h_thresh:
+        if dist <= r_land:
             self._transition(
                 Stage3State.LANDING,
-                f"landing: dist={dist:.1f}m h_speed={h_speed:.2f}m/s",
+                f"landing: dist={dist:.1f}m track_h_speed={track_h_speed:.2f}m/s h_speed={total_h_speed:.2f}m/s",
             )
         elif dist <= nav_cfg.r_arrival_m:
             self._transition(
                 Stage3State.LANDING,
-                f"arrival radius: dist={dist:.1f}m forcing landing",
+                f"arrival radius: dist={dist:.1f}m track_h_speed={track_h_speed:.2f}m/s h_speed={total_h_speed:.2f}m/s",
             )
 
     def _tick_landing(self, elapsed_s: float) -> None:
-        snap = self._fresh_snapshot()
-        if snap is None:
+        nav = self._nav_snapshot()
+        if nav is None:
             return
 
-        alt = snap.get("alt_m") or 0.0
+        lat, lon, alt, dist, brng, yaw_err, _ = nav
         neutral = self._rc.neutral_command()
         hover = self._cfg.stage3.alt_ctrl.hover_pwm
         min_pwm = self._cfg.rc_override.bounds.min_pwm
-        b = self._cfg.mission.point_b
-        bearing = bearing_deg(snap["lat"], snap["lon"], b.lat, b.lon)
-        h_speed = self._horizontal_speed(bearing)
+        track_h_speed = self._horizontal_speed(brng)
+        total_h_speed = self._horizontal_speed()
+        yaw_kp = self._cfg.stage3.nav.yaw_kp
+        yaw_delta = int(max(-150, min(150, yaw_err * yaw_kp)))
+        pitch_delta = self._approach_pitch_delta(
+            dist=dist,
+            yaw_err=yaw_err,
+            track_h_speed=track_h_speed,
+        )
 
         # Assertive descent to avoid ballooning after switching from approach to landing.
         if alt > 5.0:
@@ -426,22 +422,22 @@ class Stage3FSM:
 
         cmd = self._rc.apply(
             roll=neutral.roll,
-            pitch=neutral.pitch,
+            pitch=neutral.pitch + pitch_delta,
             throttle=desc_thr,
-            yaw=neutral.yaw,
+            yaw=neutral.yaw + yaw_delta,
         )
 
         self._logger.info(
-            "state=LANDING  elapsed=%.1fs  alt=%.2fm  h_speed=%.2fm/s  thr=%d",
-            elapsed_s, alt, h_speed, cmd.throttle,
+            "state=LANDING  elapsed=%.1fs  dist=%.1fm  alt=%.2fm  track_h_speed=%.2fm/s  h_speed=%.2fm/s  rc(pitch=%d thr=%d yaw=%d)",
+            elapsed_s, dist, alt, track_h_speed, total_h_speed, cmd.pitch, cmd.throttle, cmd.yaw,
         )
 
         land_alt = self._cfg.stage3.nav.land_complete_alt_m
         if alt <= land_alt:
             b = self._cfg.mission.point_b
             final_dist = distance_m(
-                snap["lat"],
-                snap["lon"],
+                lat,
+                lon,
                 b.lat,
                 b.lon,
             )
@@ -478,6 +474,67 @@ class Stage3FSM:
 
         return lat, lon, alt, dist, brng, yaw_err, heading
 
+    def _fine_approach_entry_radius(self) -> float:
+        nav_cfg = self._cfg.stage3.nav
+        return max(nav_cfg.r_cruise_to_fine_m, nav_cfg.r_approach_slowdown_m)
+
+    def _approach_target_track_speed(self, dist: float) -> float:
+        nav_cfg = self._cfg.stage3.nav
+        hover_target = max(0.0, nav_cfg.approach_hover_target_speed_ms)
+        max_target = max(hover_target, nav_cfg.approach_target_speed_max_ms)
+        r_land = nav_cfg.r_land_trigger_m
+        slowdown_start = max(r_land + 0.1, nav_cfg.r_approach_slowdown_m)
+
+        if dist <= r_land:
+            return hover_target
+        if dist >= slowdown_start:
+            return max_target
+
+        ratio = (dist - r_land) / (slowdown_start - r_land)
+        return hover_target + ratio * (max_target - hover_target)
+
+    def _approach_pitch_delta(self, dist: float, yaw_err: float, track_h_speed: float) -> int:
+        nav_cfg = self._cfg.stage3.nav
+        if abs(yaw_err) > nav_cfg.align_threshold_deg:
+            return 0
+
+        r_land = nav_cfg.r_land_trigger_m
+        slowdown_start = max(r_land + 0.1, nav_cfg.r_approach_slowdown_m)
+
+        if dist <= r_land:
+            base_pitch = 0
+        elif dist >= slowdown_start:
+            base_pitch = nav_cfg.pitch_delta_fine
+        else:
+            ratio = (dist - r_land) / (slowdown_start - r_land)
+            base_pitch = int(
+                round(
+                    nav_cfg.pitch_delta_fine_min
+                    + ratio * (nav_cfg.pitch_delta_fine - nav_cfg.pitch_delta_fine_min)
+                )
+            )
+
+        target_track_speed = self._approach_target_track_speed(dist)
+        speed_error = target_track_speed - track_h_speed
+        pitch_delta = base_pitch + int(round(nav_cfg.approach_pitch_speed_kp * speed_error))
+        return max(0, min(nav_cfg.approach_pitch_delta_max, pitch_delta))
+
+    def _enroute_pitch_delta(self, elapsed_s: float, yaw_err: float, h_speed: float) -> int:
+        nav_cfg = self._cfg.stage3.nav
+        ramp_s = max(0.5, nav_cfg.enroute_pitch_ramp_s)
+        ramp = min(1.0, elapsed_s / ramp_s)
+        cruise_pitch_delta = int(round(nav_cfg.pitch_delta_cruise * ramp))
+
+        if abs(yaw_err) <= nav_cfg.align_threshold_deg:
+            return cruise_pitch_delta
+
+        target_h_speed = max(0.0, nav_cfg.enroute_unaligned_target_speed_ms)
+        speed_error = target_h_speed - h_speed
+        pitch_delta = nav_cfg.enroute_unaligned_pitch_base + int(
+            round(nav_cfg.enroute_unaligned_speed_kp * speed_error)
+        )
+        return max(0, min(cruise_pitch_delta, pitch_delta))
+
     def _horizontal_speed(self, target_bearing_deg: Optional[float] = None) -> float:
         vel = getattr(self._vehicle, "velocity", None)
         if vel is not None and len(vel) >= 2:
@@ -487,6 +544,14 @@ class Stage3FSM:
             return vel[0] * math.cos(rad) + vel[1] * math.sin(rad)
         snap = telemetry_snapshot(self._vehicle)
         return snap.get("h_speed_ms") or 0.0
+
+    def _lateral_speed(self, target_bearing_deg: float) -> float:
+        """Speed component perpendicular to bearing (positive = rightward of bearing direction)."""
+        vel = getattr(self._vehicle, "velocity", None)
+        if vel is not None and len(vel) >= 2:
+            rad = math.radians(target_bearing_deg)
+            return -vel[0] * math.sin(rad) + vel[1] * math.cos(rad)
+        return 0.0
 
     def _safe_heading(self) -> float:
         """Return the vehicle's TRUE heading in degrees [0, 360).
@@ -499,6 +564,23 @@ class Stage3FSM:
         heading = getattr(self._vehicle, "heading", None)
         h = float(heading) if heading is not None else 0.0
         return (h + 180.0) % 360.0
+
+    def _wind_str(self) -> str:
+        """Return a compact wind string from the MAVLink WIND message, or empty string."""
+        wind = getattr(self._vehicle, "wind", None)
+        if wind is None:
+            return ""
+        spd = getattr(wind, "wind_speed", None)
+        direction = getattr(wind, "wind_direction", None)
+        spd_z = getattr(wind, "wind_speed_z", None)
+        parts = []
+        if spd is not None:
+            parts.append(f"wind={spd:.1f}m/s")
+        if direction is not None:
+            parts.append(f"dir={direction:.0f}°")
+        if spd_z is not None and abs(spd_z) > 0.05:
+            parts.append(f"w_z={spd_z:.1f}")
+        return " ".join(parts)
 
     # ------------------------------------------------------------------
     # Helpers: vehicle control
