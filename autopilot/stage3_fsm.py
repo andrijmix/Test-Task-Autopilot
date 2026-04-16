@@ -44,7 +44,7 @@ from enum import Enum
 from typing import Optional, Tuple
 
 from .config import AppConfig
-from .controllers import AltitudeController
+from .controllers import AltitudeController, LateralController
 from .dronekit_compat import ensure_dronekit_compat
 from .geo import bearing_deg, distance_m, normalize_angle_deg
 from .rc_override import RcCommand
@@ -120,6 +120,14 @@ class Stage3FSM:
         self._takeoff_pitch_integral = 0.0
         self._takeoff_roll_integral = 0.0
         self._takeoff_pitch_last_t = time.monotonic()
+        # Crab-angle controller: lateral speed (m/s) → heading offset (degrees).
+        # Positive lat_speed (rightward drift) → negative crab (point left).
+        # Sign convention matches LateralController: output = -(Kp*v + Ki*∫v dt)
+        self._crab_ctrl = LateralController(
+            kp=s3.nav.crab_kp,
+            ki=s3.nav.crab_ki,
+            max_roll_delta_pwm=int(s3.nav.crab_max_deg),
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -300,6 +308,7 @@ class Stage3FSM:
         threshold = target_alt * nav_cfg.takeoff_complete_fraction
         if alt >= threshold:
             self._alt_ctrl.reset()
+            self._crab_ctrl.reset()
             self._takeoff_pitch_integral = 0.0
             self._transition(
                 Stage3State.ENROUTE_TO_B,
@@ -318,6 +327,13 @@ class Stage3FSM:
         throttle = self._alt_ctrl.compute(target_alt, alt, time.monotonic())
         neutral = self._rc.neutral_command()
         h_speed = self._horizontal_speed(brng)
+        lat_speed = self._lateral_speed(brng)
+
+        # Crab-angle compensation: offset desired heading upwind so forward thrust
+        # cancels lateral wind drift. The I-term accumulates steady wind bias.
+        crab_deg = self._crab_ctrl.compute(lat_speed, time.monotonic())
+        adjusted_bearing = brng + crab_deg
+        yaw_err = normalize_angle_deg(adjusted_bearing - heading)
 
         yaw_kp = self._cfg.stage3.nav.yaw_kp
         yaw_delta = int(max(-200, min(200, yaw_err * yaw_kp)))
@@ -336,9 +352,11 @@ class Stage3FSM:
         )
 
         self._logger.info(
-            "state=ENROUTE_TO_B  dist=%.1fm  brng=%.1f  hdg=%.1f  "
-            "alt=%.1fm  alt_err=%.1f  h_speed=%.2fm/s  aligned=%s  rc(roll=%d pitch=%d thr=%d yaw=%d)",
-            dist, brng, heading, alt, alt_err, h_speed, aligned,
+            "state=ENROUTE_TO_B  dist=%.1fm  brng=%.1f  crab=%.1f  adj_brng=%.1f  hdg=%.1f  "
+            "alt=%.1fm  alt_err=%.1f  h_speed=%.2fm/s  lat_speed=%.2fm/s  aligned=%s  "
+            "rc(roll=%d pitch=%d thr=%d yaw=%d)",
+            dist, brng, crab_deg, adjusted_bearing % 360, heading, alt, alt_err,
+            h_speed, lat_speed, aligned,
             cmd.roll, cmd.pitch, cmd.throttle, cmd.yaw,
         )
 
@@ -354,7 +372,7 @@ class Stage3FSM:
         if nav is None:
             return
 
-        _, _, alt, dist, brng, yaw_err, _ = nav
+        _, _, alt, dist, brng, _, heading = nav
         target_alt = self._cfg.mission.target_altitude_m
         alt_err = target_alt - alt
 
@@ -362,6 +380,11 @@ class Stage3FSM:
         neutral = self._rc.neutral_command()
         track_h_speed = self._horizontal_speed(brng)
         total_h_speed = self._horizontal_speed()
+        lat_speed = self._lateral_speed(brng)
+
+        crab_deg = self._crab_ctrl.compute(lat_speed, time.monotonic())
+        adjusted_bearing = brng + crab_deg
+        yaw_err = normalize_angle_deg(adjusted_bearing - heading)
 
         yaw_kp = self._cfg.stage3.nav.yaw_kp
         yaw_delta = int(max(-150, min(150, yaw_err * yaw_kp)))
@@ -381,8 +404,10 @@ class Stage3FSM:
 
         self._logger.info(
             "state=APPROACH_FINE  dist=%.1fm  alt=%.1fm  alt_err=%.1f  "
-            "track_h_speed=%.2fm/s  target_track_speed=%.2fm/s  h_speed=%.2fm/s  aligned=%s  rc(roll=%d pitch=%d thr=%d yaw=%d)",
-            dist, alt, alt_err, track_h_speed, target_track_speed, total_h_speed, aligned,
+            "track_h_speed=%.2fm/s  target_track_speed=%.2fm/s  h_speed=%.2fm/s  "
+            "lat_speed=%.2fm/s  crab=%.1f  aligned=%s  rc(roll=%d pitch=%d thr=%d yaw=%d)",
+            dist, alt, alt_err, track_h_speed, target_track_speed, total_h_speed,
+            lat_speed, crab_deg, aligned,
             cmd.roll, cmd.pitch, cmd.throttle, cmd.yaw,
         )
 
@@ -402,12 +427,18 @@ class Stage3FSM:
         if nav is None:
             return
 
-        lat, lon, alt, dist, brng, yaw_err, _ = nav
+        lat, lon, alt, dist, brng, _, heading = nav
         neutral = self._rc.neutral_command()
         hover = self._cfg.stage3.alt_ctrl.hover_pwm
         min_pwm = self._cfg.rc_override.bounds.min_pwm
         track_h_speed = self._horizontal_speed(brng)
         total_h_speed = self._horizontal_speed()
+        lat_speed = self._lateral_speed(brng)
+
+        crab_deg = self._crab_ctrl.compute(lat_speed, time.monotonic())
+        adjusted_bearing = brng + crab_deg
+        yaw_err = normalize_angle_deg(adjusted_bearing - heading)
+
         yaw_kp = self._cfg.stage3.nav.yaw_kp
         yaw_delta = int(max(-150, min(150, yaw_err * yaw_kp)))
         pitch_delta = self._approach_pitch_delta(
@@ -434,8 +465,11 @@ class Stage3FSM:
         )
 
         self._logger.info(
-            "state=LANDING  elapsed=%.1fs  dist=%.1fm  alt=%.2fm  track_h_speed=%.2fm/s  h_speed=%.2fm/s  rc(pitch=%d thr=%d yaw=%d)",
-            elapsed_s, dist, alt, track_h_speed, total_h_speed, cmd.pitch, cmd.throttle, cmd.yaw,
+            "state=LANDING  elapsed=%.1fs  dist=%.1fm  alt=%.2fm  "
+            "track_h_speed=%.2fm/s  h_speed=%.2fm/s  lat_speed=%.2fm/s  crab=%.1f  "
+            "rc(roll=%d pitch=%d thr=%d yaw=%d)",
+            elapsed_s, dist, alt, track_h_speed, total_h_speed, lat_speed, crab_deg,
+            cmd.roll, cmd.pitch, cmd.throttle, cmd.yaw,
         )
 
         land_alt = self._cfg.stage3.nav.land_complete_alt_m

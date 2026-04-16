@@ -127,14 +127,22 @@ class Stage3NavConfig:
     approach_pitch_delta_max: int = 260       # Cap recovery pitch during APPROACH_FINE so it stays gentler than cruise
     enroute_pitch_ramp_s: float = 8.0         # Smoothly ramp pitch after takeoff to protect altitude hold
 
+    # Crab-angle wind compensation — yaw channel
+    # Instead of fighting lateral drift with roll (which causes banked turns in Stabilize),
+    # we offset the desired heading upwind so the forward thrust vector cancels the wind.
+    # e.g. 5 m/s lateral wind → ~20-25° crab → drone nose points right of B → ground track goes straight.
+    crab_kp: float = 5.0           # P gain: lateral speed (m/s) → crab angle correction (degrees)
+    crab_ki: float = 1.0           # I gain: integrated drift (m·s) → crab angle; builds steady-wind feedforward
+    crab_max_deg: float = 35.0     # Max crab angle magnitude (degrees); limits extreme upwind pointing
+
     # Heading alignment guard
     align_threshold_deg: float = 20.0        # suppress forward pitch until within this many degrees of bearing
 
     # Phase transition radii [m]
     r_cruise_to_fine_m: float = 18.0         # Switch ENROUTE → APPROACH_FINE before the slowdown zone, not on top of the point
     r_approach_slowdown_m: float = 18.0       # Stay assertive longer, then brake later
-    r_land_trigger_m: float = 4.8             # Trigger LANDING close enough to finish under 5 m
-    r_arrival_m: float = 3.0                  # Hard arrival radius
+    r_land_trigger_m: float = 10.0            # Trigger LANDING once within this radius (increased for wind tolerance)
+    r_arrival_m: float = 8.0                  # Hard arrival radius
 
     # Landing conditions
     land_h_speed_threshold_ms: float = 0.25   # Allow landing once total horizontal speed is essentially stopped near the target

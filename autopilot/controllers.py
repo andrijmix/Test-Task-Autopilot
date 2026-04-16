@@ -76,3 +76,64 @@ class AltitudeController:
         """Clear integrator state (call when entering a new phase)."""
         self._integral = 0.0
         self._last_t = None
+
+
+class LateralController:
+    """PI controller for lateral drift correction via the roll channel.
+
+    Measures lateral speed perpendicular to the desired track bearing and
+    outputs a roll PWM delta that counteracts the drift.
+
+    Sign convention
+    ---------------
+    lateral_speed > 0  →  drone drifting rightward of track  →  roll_delta < 0 (bank left)
+    lateral_speed < 0  →  drone drifting leftward of track   →  roll_delta > 0 (bank right)
+
+    roll_delta = -(Kp * lateral_speed + Ki * ∫lateral_speed dt)
+
+    The I term naturally accumulates steady-state wind offset and provides a
+    feedforward compensation once the wind pattern is learned (typically within
+    the first 5–10 seconds of cruise flight).
+    """
+
+    def __init__(
+        self,
+        kp: float,
+        ki: float,
+        max_roll_delta_pwm: int,
+    ) -> None:
+        self._kp = kp
+        self._ki = ki
+        self._max_delta = max_roll_delta_pwm
+        self._integral: float = 0.0
+        self._last_t: float | None = None
+
+    def compute(self, lateral_speed: float, t: float) -> int:
+        """Return roll PWM delta to counteract lateral drift.
+
+        Parameters
+        ----------
+        lateral_speed   m/s perpendicular to track, positive = rightward
+        t               monotonic timestamp in seconds
+
+        Returns
+        -------
+        int  PWM delta: negative = bank left, positive = bank right
+        """
+        dt = 0.0
+        if self._last_t is not None:
+            dt = max(0.0, min(1.0, t - self._last_t))
+        self._last_t = t
+
+        self._integral += lateral_speed * dt
+        if self._ki > 1e-9:
+            max_i = self._max_delta / self._ki
+            self._integral = max(-max_i, min(max_i, self._integral))
+
+        delta = -(self._kp * lateral_speed + self._ki * self._integral)
+        return max(-self._max_delta, min(self._max_delta, int(round(delta))))
+
+    def reset(self) -> None:
+        """Clear integrator state."""
+        self._integral = 0.0
+        self._last_t = None

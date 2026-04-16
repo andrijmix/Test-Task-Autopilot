@@ -129,7 +129,8 @@ def test_takeoff_applies_pitch_correction_to_hold_against_backward_drift() -> No
 
 def test_approach_does_not_land_outside_land_radius() -> None:
     fsm = _build_fsm()
-    fsm._nav_snapshot = lambda: (50.44, 30.44, 300.0, 5.2, 180.0, 35.0, 180.0)
+    # dist=12m is outside r_land_trigger_m=10.0m → should NOT trigger landing
+    fsm._nav_snapshot = lambda: (50.44, 30.44, 300.0, 12.0, 180.0, 35.0, 180.0)
     fsm._horizontal_speed = lambda target_bearing_deg=None: -4.45 if target_bearing_deg is not None else 4.45
     fsm._transition = Mock()
 
@@ -140,7 +141,8 @@ def test_approach_does_not_land_outside_land_radius() -> None:
 
 def test_approach_lands_once_inside_land_radius_even_with_horizontal_motion() -> None:
     fsm = _build_fsm()
-    fsm._nav_snapshot = lambda: (50.44, 30.44, 300.0, 2.4, 180.0, 5.0, 180.0)
+    # dist=8.0m is inside r_land_trigger_m=10.0m → should trigger landing
+    fsm._nav_snapshot = lambda: (50.44, 30.44, 300.0, 8.0, 180.0, 5.0, 180.0)
     fsm._horizontal_speed = lambda target_bearing_deg=None: 1.30 if target_bearing_deg is None else -0.35
     fsm._transition = Mock()
 
