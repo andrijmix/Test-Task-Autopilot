@@ -6,8 +6,24 @@ from unittest.mock import Mock
 import pytest
 
 from autopilot.config import build_default_config
+from autopilot.navigation import NavigationSnapshot
 from autopilot.rc_override import RcCommand
 from autopilot.stage3_fsm import Stage3FSM
+
+
+def _make_snap(
+    alt_m: float = 0.0,
+    heading_deg: float = 180.0,
+    armed: bool = True,
+) -> NavigationSnapshot:
+    return NavigationSnapshot(
+        x=0.0, y=0.0, alt_m=alt_m, heading_deg=heading_deg,
+        vx=0.0, vy=0.0, armed=armed, mode="STABILIZE",
+    )
+
+
+def _nav_mock(alt: float, dist: float, brng: float, yaw_err: float, heading: float):
+    return _make_snap(alt_m=alt, heading_deg=heading), dist, brng, yaw_err
 
 
 class DummyRcAdapter:
@@ -29,7 +45,8 @@ class DummyVehicle:
         self.velocity = [0.0, 0.0, 0.0]
         self.heading = 0.0
         self.location = SimpleNamespace(
-            global_relative_frame=SimpleNamespace(lat=50.450739, lon=30.461242, alt=300.0)
+            global_relative_frame=SimpleNamespace(lat=50.450739, lon=30.461242, alt=300.0),
+            local_frame=SimpleNamespace(north=0.0, east=0.0, down=0.0),
         )
 
 
@@ -106,12 +123,7 @@ def test_takeoff_pitch_correction_does_not_push_backward_when_already_moving_to_
 
 def test_takeoff_applies_pitch_correction_to_hold_against_backward_drift() -> None:
     fsm = _build_fsm()
-    fsm._fresh_snapshot = lambda: {
-        "lat": 50.44,
-        "lon": 30.44,
-        "alt_m": 40.0,
-        "armed": True,
-    }
+    fsm._fresh_snapshot = lambda: _make_snap(alt_m=40.0, armed=True)
     fsm._horizontal_speed = lambda target_bearing_deg=None: -0.5 if target_bearing_deg is not None else 0.5
 
     recorded = {}
@@ -130,7 +142,7 @@ def test_takeoff_applies_pitch_correction_to_hold_against_backward_drift() -> No
 def test_approach_does_not_land_outside_land_radius() -> None:
     fsm = _build_fsm()
     # dist=12m is outside r_land_trigger_m=10.0m → should NOT trigger landing
-    fsm._nav_snapshot = lambda: (50.44, 30.44, 300.0, 12.0, 180.0, 35.0, 180.0)
+    fsm._nav_snapshot = lambda: _nav_mock(300.0, 12.0, 180.0, 35.0, 180.0)
     fsm._horizontal_speed = lambda target_bearing_deg=None: -4.45 if target_bearing_deg is not None else 4.45
     fsm._transition = Mock()
 
@@ -142,7 +154,7 @@ def test_approach_does_not_land_outside_land_radius() -> None:
 def test_approach_lands_once_inside_land_radius_even_with_horizontal_motion() -> None:
     fsm = _build_fsm()
     # dist=8.0m is inside r_land_trigger_m=10.0m → should trigger landing
-    fsm._nav_snapshot = lambda: (50.44, 30.44, 300.0, 8.0, 180.0, 5.0, 180.0)
+    fsm._nav_snapshot = lambda: _nav_mock(300.0, 8.0, 180.0, 5.0, 180.0)
     fsm._horizontal_speed = lambda target_bearing_deg=None: 1.30 if target_bearing_deg is None else -0.35
     fsm._transition = Mock()
 
@@ -181,7 +193,7 @@ def test_approach_adds_recovery_pitch_when_wind_pushes_away_from_point() -> None
 
 def test_landing_keeps_approach_horizontal_hold_while_descending() -> None:
     fsm = _build_fsm()
-    fsm._nav_snapshot = lambda: (50.44, 30.44, 30.0, 2.0, 180.0, 5.0, 180.0)
+    fsm._nav_snapshot = lambda: _nav_mock(30.0, 2.0, 180.0, 5.0, 180.0)
     fsm._transition = Mock()
     fsm._horizontal_speed = lambda target_bearing_deg=None: 1.20 if target_bearing_deg is None else -0.40
 
@@ -208,7 +220,7 @@ def test_fine_approach_entry_radius_uses_slowdown_radius_when_configured_lower()
 
 def test_enroute_enters_approach_before_crossing_the_point() -> None:
     fsm = _build_fsm()
-    fsm._nav_snapshot = lambda: (50.44, 30.44, 300.0, 12.0, 180.0, 5.0, 180.0)
+    fsm._nav_snapshot = lambda: _nav_mock(300.0, 12.0, 180.0, 5.0, 180.0)
     fsm._horizontal_speed = lambda target_bearing_deg=None: 1.0
     fsm._transition = Mock()
 

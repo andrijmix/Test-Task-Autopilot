@@ -38,3 +38,14 @@ def normalize_angle_deg(angle_deg: float) -> float:
     if normalized == -180.0:
         return 180.0
     return normalized
+
+
+def distance_2d(x1: float, y1: float, x2: float, y2: float) -> float:
+    """Euclidean distance between two points in local NE frame [m]."""
+    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+
+
+def bearing_2d(x1: float, y1: float, x2: float, y2: float) -> float:
+    """Bearing from (x1,y1) to (x2,y2) in local NE frame [0, 360). x=North, y=East."""
+    angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+    return (angle + 360.0) % 360.0

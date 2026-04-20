@@ -46,9 +46,9 @@ from typing import Optional, Tuple
 from .config import AppConfig
 from .controllers import AltitudeController, LateralController
 from .dronekit_compat import ensure_dronekit_compat
-from .geo import bearing_deg, distance_m, normalize_angle_deg
+from .geo import bearing_2d, distance_2d, normalize_angle_deg
+from .navigation import GpsPositionProvider, NavigationSnapshot, PositionProvider
 from .rc_override import RcCommand
-from .telemetry import telemetry_snapshot
 
 ensure_dronekit_compat()
 
@@ -95,12 +95,16 @@ class Stage3FSM:
         rc_adapter,
         logger: logging.Logger,
         dry_run: bool = False,
+        pos_provider: Optional[PositionProvider] = None,
     ) -> None:
         self._vehicle = vehicle
         self._cfg = cfg
         self._rc = rc_adapter
         self._logger = logger
         self._dry_run = dry_run
+        self._pos_provider: PositionProvider = (
+            pos_provider if pos_provider is not None else GpsPositionProvider(vehicle, cfg)
+        )
 
         self._state = Stage3State.INIT
         self._state_entered_at = time.monotonic()
@@ -237,12 +241,11 @@ class Stage3FSM:
         if snap is None:
             return
 
-        alt = snap.get("alt_m") or 0.0
-        armed = snap.get("armed", False)
+        alt = snap.alt_m
+        armed = snap.armed
         target_alt = self._cfg.mission.target_altitude_m
         neutral = self._rc.neutral_command()
-        b = self._cfg.mission.point_b
-        bearing = bearing_deg(snap["lat"], snap["lon"], b.lat, b.lon)
+        bearing = bearing_2d(snap.x, snap.y, self._pos_provider.target_x, self._pos_provider.target_y)
         h_speed = self._horizontal_speed(bearing)
 
         if not armed:
@@ -320,7 +323,9 @@ class Stage3FSM:
         if nav is None:
             return
 
-        _, _, alt, dist, brng, yaw_err, heading = nav
+        snap, dist, brng, yaw_err = nav
+        alt = snap.alt_m
+        heading = snap.heading_deg
         target_alt = self._cfg.mission.target_altitude_m
         alt_err = target_alt - alt
 
@@ -372,7 +377,9 @@ class Stage3FSM:
         if nav is None:
             return
 
-        _, _, alt, dist, brng, _, heading = nav
+        snap, dist, brng, _ = nav
+        alt = snap.alt_m
+        heading = snap.heading_deg
         target_alt = self._cfg.mission.target_altitude_m
         alt_err = target_alt - alt
 
@@ -427,7 +434,9 @@ class Stage3FSM:
         if nav is None:
             return
 
-        lat, lon, alt, dist, brng, _, heading = nav
+        snap, dist, brng, _ = nav
+        alt = snap.alt_m
+        heading = snap.heading_deg
         neutral = self._rc.neutral_command()
         hover = self._cfg.stage3.alt_ctrl.hover_pwm
         min_pwm = self._cfg.rc_override.bounds.min_pwm
@@ -474,12 +483,9 @@ class Stage3FSM:
 
         land_alt = self._cfg.stage3.nav.land_complete_alt_m
         if alt <= land_alt:
-            b = self._cfg.mission.point_b
-            final_dist = distance_m(
-                lat,
-                lon,
-                b.lat,
-                b.lon,
+            final_dist = distance_2d(
+                snap.x, snap.y,
+                self._pos_provider.target_x, self._pos_provider.target_y,
             )
             self._transition(
                 Stage3State.COMPLETE,
@@ -490,29 +496,23 @@ class Stage3FSM:
     # Helpers: navigation & telemetry
     # ------------------------------------------------------------------
 
-    def _fresh_snapshot(self) -> Optional[dict]:
-        snap = telemetry_snapshot(self._vehicle)
-        if snap.get("lat") is None or snap.get("lon") is None:
-            self._abort("GPS position unavailable")
+    def _fresh_snapshot(self) -> Optional[NavigationSnapshot]:
+        snap = self._pos_provider.snapshot()
+        if snap is None:
+            self._abort("position unavailable")
             return None
         return snap
 
-    def _nav_snapshot(self) -> Optional[Tuple[float, float, float, float, float, float, float]]:
+    def _nav_snapshot(self) -> Optional[Tuple[NavigationSnapshot, float, float, float]]:
         snap = self._fresh_snapshot()
         if snap is None:
             return None
 
-        lat = snap["lat"]
-        lon = snap["lon"]
-        alt = snap.get("alt_m") or 0.0
+        dist = distance_2d(snap.x, snap.y, self._pos_provider.target_x, self._pos_provider.target_y)
+        brng = bearing_2d(snap.x, snap.y, self._pos_provider.target_x, self._pos_provider.target_y)
+        yaw_err = normalize_angle_deg(brng - snap.heading_deg)
 
-        b = self._cfg.mission.point_b
-        dist = distance_m(lat, lon, b.lat, b.lon)
-        brng = bearing_deg(lat, lon, b.lat, b.lon)
-        heading = self._safe_heading()
-        yaw_err = normalize_angle_deg(brng - heading)
-
-        return lat, lon, alt, dist, brng, yaw_err, heading
+        return snap, dist, brng, yaw_err
 
     def _fine_approach_entry_radius(self) -> float:
         nav_cfg = self._cfg.stage3.nav
@@ -603,8 +603,7 @@ class Stage3FSM:
                 return math.sqrt(vel[0] ** 2 + vel[1] ** 2)
             rad = math.radians(target_bearing_deg)
             return vel[0] * math.cos(rad) + vel[1] * math.sin(rad)
-        snap = telemetry_snapshot(self._vehicle)
-        return snap.get("h_speed_ms") or 0.0
+        return 0.0
 
     def _lateral_speed(self, target_bearing_deg: float) -> float:
         """Speed component perpendicular to bearing (positive = rightward of bearing direction)."""
@@ -613,18 +612,6 @@ class Stage3FSM:
             rad = math.radians(target_bearing_deg)
             return -vel[0] * math.sin(rad) + vel[1] * math.cos(rad)
         return 0.0
-
-    def _safe_heading(self) -> float:
-        """Return the vehicle's TRUE heading in degrees [0, 360).
-
-        The ArduCopter SITL magnetometer is calibrated 180° inverted relative to
-        the vehicle body, so vehicle.heading reports the direction OPPOSITE to the
-        nose.  Adding 180° converts the raw magnetic reading to the actual nose
-        direction, which matches the GPS ground-track when flying at speed.
-        """
-        heading = getattr(self._vehicle, "heading", None)
-        h = float(heading) if heading is not None else 0.0
-        return (h + 180.0) % 360.0
 
     def _wind_str(self) -> str:
         """Return a compact wind string from the MAVLink WIND message, or empty string."""

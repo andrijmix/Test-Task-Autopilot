@@ -36,6 +36,17 @@ def run_preflight_checks(vehicle: Vehicle, cfg: PreflightConfig) -> PreflightRep
     return PreflightReport(checks=checks)
 
 
+def run_odometry_preflight_checks(vehicle: Vehicle, cfg: PreflightConfig) -> PreflightReport:
+    """Preflight checks for odometry-based navigation (no GPS required)."""
+    checks = [
+        _check_heartbeat(vehicle, cfg),
+        _check_armable(vehicle, cfg),
+        _check_mode_readable(vehicle),
+        _check_odometry_available(vehicle),
+    ]
+    return PreflightReport(checks=checks)
+
+
 def _check_heartbeat(vehicle: Vehicle, cfg: PreflightConfig) -> CheckResult:
     age = vehicle.last_heartbeat
     if age is None:
@@ -61,6 +72,17 @@ def _check_mode_readable(vehicle: Vehicle) -> CheckResult:
     if not mode_name:
         return CheckResult("mode", False, "Vehicle mode is not readable")
     return CheckResult("mode", True, f"mode={mode_name}")
+
+
+def _check_odometry_available(vehicle: Vehicle) -> CheckResult:
+    local = getattr(getattr(vehicle, "location", None), "local_frame", None)
+    if local is None:
+        return CheckResult("odometry", False, "LOCAL_POSITION_NED not available")
+    north = getattr(local, "north", None)
+    east = getattr(local, "east", None)
+    if north is None or east is None:
+        return CheckResult("odometry", False, "LOCAL_POSITION_NED fields missing")
+    return CheckResult("odometry", True, f"local_pos north={north:.2f}m east={east:.2f}m")
 
 
 def _check_gps_status(vehicle: Vehicle, cfg: PreflightConfig) -> CheckResult:

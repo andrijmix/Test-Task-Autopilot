@@ -4,9 +4,9 @@ from enum import Enum
 from typing import Optional, Protocol
 
 from .config import AppConfig
-from .geo import bearing_deg, distance_m, normalize_angle_deg
+from .geo import bearing_2d, distance_2d, normalize_angle_deg
+from .navigation import GpsPositionProvider, PositionProvider
 from .rc_override import RcCommand
-from .telemetry import telemetry_snapshot
 
 
 class MissionState(str, Enum):
@@ -31,11 +31,21 @@ class RcAdapterProtocol(Protocol):
 
 
 class MissionFSM:
-    def __init__(self, vehicle, cfg: AppConfig, rc_adapter: RcAdapterProtocol, logger: logging.Logger):
+    def __init__(
+        self,
+        vehicle,
+        cfg: AppConfig,
+        rc_adapter: RcAdapterProtocol,
+        logger: logging.Logger,
+        pos_provider: Optional[PositionProvider] = None,
+    ):
         self._vehicle = vehicle
         self._cfg = cfg
         self._rc = rc_adapter
         self._logger = logger
+        self._pos_provider: PositionProvider = (
+            pos_provider if pos_provider is not None else GpsPositionProvider(vehicle, cfg)
+        )
         self._state = MissionState.INIT
         self._state_entered_at = time.time()
 
@@ -94,19 +104,14 @@ class MissionFSM:
             self._transition(MissionState.NAVIGATE_STUB, "takeoff stub hold complete")
 
     def _tick_navigate_stub(self) -> None:
-        snap = telemetry_snapshot(self._vehicle)
-        lat = snap.get("lat")
-        lon = snap.get("lon")
-
-        if lat is None or lon is None:
+        snap = self._pos_provider.snapshot()
+        if snap is None:
             self._transition(MissionState.ABORT, "position unavailable during navigation")
             return
 
-        target = self._cfg.mission.point_b
-        dist = distance_m(lat, lon, target.lat, target.lon)
-        bearing_to_target = bearing_deg(lat, lon, target.lat, target.lon)
-        heading = self._safe_heading_deg()
-        yaw_error = normalize_angle_deg(bearing_to_target - heading)
+        dist = distance_2d(snap.x, snap.y, self._pos_provider.target_x, self._pos_provider.target_y)
+        bearing_to_target = bearing_2d(snap.x, snap.y, self._pos_provider.target_x, self._pos_provider.target_y)
+        yaw_error = normalize_angle_deg(bearing_to_target - snap.heading_deg)
 
         cmd = self._build_navigation_command(dist, yaw_error)
         applied = self._rc.apply(
@@ -121,7 +126,7 @@ class MissionFSM:
             self._state.value,
             dist,
             bearing_to_target,
-            heading,
+            snap.heading_deg,
             yaw_error,
             applied.roll,
             applied.pitch,
@@ -171,12 +176,6 @@ class MissionFSM:
             throttle=neutral.throttle,
             yaw=neutral.yaw + yaw_delta,
         )
-
-    def _safe_heading_deg(self) -> float:
-        heading = getattr(self._vehicle, "heading", None)
-        if heading is None:
-            return 0.0
-        return float(heading)
 
     def _get_timeout_s(self, state: MissionState) -> Optional[float]:
         cfg = self._cfg.mission_timeouts
